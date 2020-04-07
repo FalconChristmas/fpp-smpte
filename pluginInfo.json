@@ -1,0 +1,19 @@
+{
+	"repoName": "fpp-smpte",
+	"name": "SMPTE",
+	"author": "Daniel Kulp",
+	"description": "Listener/Generator for SMPTE Linear Time Codes",
+	"homeURL": "https://github.com/FalconChristmas/fpp-smpte",
+	"srcURL": "https://github.com/FalconChristmas/fpp-smpte.git",
+	"bugURL": "https://github.com/FalconChristmas/fpp-smpte/issues",
+	"versions": [
+        {
+            "minFPPVersion": "4.0",
+            "maxFPPVersion": "0",
+            "branch": "master",
+            "sha": "",
+            "allowUpdates": 1
+        }
+	]
+}
+
