@@ -209,9 +209,9 @@ public:
             f *= 1000;
             msTimeStamp += f;
 
-            //printf("msTimeStamp: %d\n", (int)msTimeStamp);
             uint64_t df = msTimeStamp > p->lastMS ? (msTimeStamp - p->lastMS) : (p->lastMS - msTimeStamp);
-            if (df < 5000 && p->inputEventFile >= 0) {
+            if (df > 0 && df < 5000 && p->inputEventFile >= 0) {
+                //printf("msTimeStamp: %d     frame: %d\n", (int)msTimeStamp, (int)stime.frame);
                 p->currentPosMS = msTimeStamp;
                 p->currentUserBits =  getUserBits(&frame.ltc);
                 //printf("Frame: h: %d     m: %d    s:   %d    f: %d       ts: %d\n", stime.hours, stime.mins, stime.secs, stime.frame, (int)msTimeStamp);
@@ -240,7 +240,7 @@ public:
         want.freq = 48000;
         want.format = AUDIO_S16SYS;
         want.channels = 1;
-        want.samples = 2048;
+        want.samples = 1024;
         want.callback = (SDL_AudioCallback)InputAudioCallback;
         want.userdata = this;
         audioDev = SDL_OpenAudioDevice(dev.c_str(), 1, &want, &obtained, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
