@@ -9,6 +9,7 @@
 #include "Plugin.h"
 #include "MultiSync.h"
 #include "playlist/Playlist.h"
+#include "channeloutput/channeloutputthread.h"
 
 
 class FPPSMPTEPlugin : public FPPPlugin, public MultiSyncPlugin {
@@ -40,32 +41,56 @@ public:
         }
     }
     
+    uint64_t lastFrame;
     void encodeTimestamp(uint64_t ms) {
         int len = SDL_GetQueuedAudioSize(audioDev);
         if (len > 2048) {
             return;
         }
         
-        uint64_t sf = ms % 1000;
-        ms /= 1000;
-        sf *= outputFramerate;
-        sf /= 1000;
-        if (outputTimeCode.frame == sf && ((ms % 60) == outputTimeCode.secs)) {
-            //duplicate, return
-            return;
-        }
-        outputTimeCode.frame = sf;
-        outputTimeCode.secs = ms % 60;
-        ms /= 60;
-        outputTimeCode.mins = ms % 60;
-        ms /= 60;
-        outputTimeCode.hours = ms;
-        ltc_encoder_set_timecode(ltcEncoder, &outputTimeCode);
-        ltc_encoder_encode_frame(ltcEncoder);
-
-        ltcsnd_sample_t *buf = ltc_encoder_get_bufptr(ltcEncoder, &len, 1);
-        SDL_QueueAudio(audioDev, buf, len);
+        uint64_t frame = ms;
+        frame *= outputFramerate;
+        frame /= 1000;
         
+        if (lastFrame != frame) {
+            if (lastFrame == (frame - 1)) {
+                ltc_encoder_inc_timecode(ltcEncoder);
+            } else {
+                uint64_t sf = ms % 1000;
+                ms /= 1000;
+                sf *= outputFramerate;
+                sf /= 1000;
+                if (outputTimeCode.frame == sf && ((ms % 60) == outputTimeCode.secs)) {
+                    //duplicate, return
+                    return;
+                }
+                outputTimeCode.frame = sf;
+                //printf("Frame:  %d\n", outputTimeCode.frame);
+                outputTimeCode.secs = ms % 60;
+                ms /= 60;
+                outputTimeCode.mins = ms % 60;
+                ms /= 60;
+                outputTimeCode.hours = ms;
+                ltc_encoder_set_timecode(ltcEncoder, &outputTimeCode);
+            }
+            lastFrame = frame;
+            ltc_encoder_encode_frame(ltcEncoder);
+            ltcsnd_sample_t *buf = ltc_encoder_get_bufptr(ltcEncoder, &len, 1);
+            SDL_QueueAudio(audioDev, buf, len);
+        }
+        int i = GetChannelOutputRefreshRate();
+        ms += (1000/i);
+        frame = ms;
+        frame *= outputFramerate;
+        frame /= 1000;
+        if ((lastFrame+1) < frame) {
+            //next frame will be skipped, queue it now
+            ltc_encoder_inc_timecode(ltcEncoder);
+            lastFrame++;
+            ltc_encoder_encode_frame(ltcEncoder);
+            ltcsnd_sample_t *buf = ltc_encoder_get_bufptr(ltcEncoder, &len, 1);
+            SDL_QueueAudio(audioDev, buf, len);
+        }
     }
     
     virtual void SendSeqSyncPacket(const std::string &filename, int frames, float seconds) override {
@@ -130,10 +155,10 @@ public:
             
             ltc_encoder_set_bufsize(ltcEncoder, obtained.freq, outputFramerate);
             ltc_encoder_reinit(ltcEncoder, obtained.freq, outputFramerate,
-                    outputFramerate==25?LTC_TV_625_50:LTC_TV_525_60, LTC_USE_DATE);
+                    outputFramerate==25?LTC_TV_625_50:LTC_TV_525_60, 0);
             ltc_encoder_set_filter(ltcEncoder, 0);
-            ltc_encoder_set_filter(ltcEncoder, 25.0);
-            ltc_encoder_set_volume(ltcEncoder, -18.0);
+            //ltc_encoder_set_filter(ltcEncoder, 25.0);
+            //ltc_encoder_set_volume(ltcEncoder, -18.0);
 
             encodeTimestamp(0);
         }
