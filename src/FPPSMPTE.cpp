@@ -295,7 +295,7 @@ public:
                 
                 std::string pl = "";
                 std::string f = "smpte-pl-" + std::to_string(currentUserBits);
-                if (FileExists("/home/fpp/media/playlists" + f + ".json")) {
+                if (FileExists("/home/fpp/media/playlists/" + f + ".json")) {
                     pl = f;
                 }
                 if (pl == "") {
