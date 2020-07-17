@@ -124,7 +124,7 @@ public:
     }
     
     void startAudio() {
-        if (audioDev <= 1) {
+        if (audioDev <= 1 && enabled) {
             std::string dev = settings["SMPTEOutputDevice"];
             if (dev == "") {
                 LogInfo(VB_PLUGIN, "SMPTE - No Output Audio Device selected\n");
@@ -178,6 +178,7 @@ public:
                 LogInfo(VB_PLUGIN, "SMPTE - No Output Audio Device selected\n");
                 return false;
             }
+            enabled = true;
             outputFramerate = std::stof(settings["SMPTEOutputFrameRate"]);
             
             
@@ -330,8 +331,9 @@ public:
     }
     
     
-    SDL_AudioDeviceID audioDev;
+    SDL_AudioDeviceID audioDev = 0;
     
+    bool        enabled = false;
     LTCDecoder *ltcDecoder = nullptr;
     ltc_off_t  decoderPos = 0;
     float      inputFramerate = 30.0f;
