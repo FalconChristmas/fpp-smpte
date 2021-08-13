@@ -1,0 +1,115 @@
+{
+    "settingGroups": {
+        "SMPTETimeCodeInput": {
+            "description": "SMPTE TimeCode Support",
+            "settings": [
+                "SMPTETimeCodeEnabled",
+                "SMPTEOutputDevice",
+                "SMPTEInputDevice",
+                "SMPTETimeCodeType",
+                "SMPTETimeCodeHourIsIndex",
+                "SMPTEInputPlaylist",
+                "SMPTEResendMultisync"
+            ]   
+        }
+    },
+    "settings": {
+        "SMPTETimeCodeEnabled": {
+            "name": "SMPTETimeCodeEnabled",
+            "description": "Enable TimeCodes",
+            "tip": "Enable SMPTE TimeCode Support",
+            "restart": 1,
+            "reboot": 0,
+            "type": "checkbox",
+            "default": 0,
+            "children": {
+                "1": [
+                    "SMPTETimeCodeType",
+                    "SMPTEOutputDevice",
+                    "SMPTEInputDevice",
+                    "SMPTETimeCodeHourIsIndex",
+                    "SMPTEInputPlaylist",
+                    "SMPTEResendMultisync"
+                ]
+            }
+        },
+        "SMPTETimeCodeType": {
+            "name": "SMPTETimeCodeType",
+            "description": "SMPTE TimeCode Type",
+            "tip": "The format of the TimeCode",
+            "restart": 1,
+            "reboot": 0,
+            "default": 3,
+            "type": "select",
+            "options": {
+                "30fps": 30,
+                "29.97fps": 29.97,
+                "25fps": 25,
+                "24fps": 24
+            }
+        },
+        "SMPTETimeCodeHourIsIndex": {
+            "name": "SMPTETimeCodeHourIsIndex",
+            "description": "Hour Field Is Playlist Index",
+            "tip": "If enabled, the hour field of the time code will represent the index into the playlist instead of the actual hour.",
+            "restart": 1,
+            "reboot": 0,
+            "type": "checkbox",
+            "default": 0
+        },
+        "SMPTEInputPlaylist": {
+            "name": "SMPTEInputPlaylist",
+            "description": "Playlist to sync the SMPTE TimeCode",
+            "type": "select",
+            "default": "",
+            "restart": 1,
+            "reboot": 0,
+            "optionsURL": "api/playlists",
+            "optionCanBeBlank": true,
+            "fppModes": [
+                "remote"
+            ]
+        },
+        "SMPTEOutputDevice": {
+            "name": "SMPTEOutputDevice",
+            "description": "Output Sound Device",
+            "tip": "The Audio Output Device to send the TimeCode",
+            "restart": 1,
+            "reboot": 0,
+            "default": "",
+            "type": "select",
+            "optionsURL": "api/settings/AudioOutputList/options",
+            "optionCanBeBlank": true,
+            "fppModes": [
+                "player"
+            ]
+        },
+        "SMPTEInputDevice": {
+            "name": "SMPTEInputDevice",
+            "description": "Input Sound Device",
+            "tip": "The Audio Input Device to receive the TimeCode",
+            "restart": 1,
+            "reboot": 0,
+            "default": "",
+            "type": "select",
+            "optionsURL": "api/settings/AudioInputList/options",
+            "optionCanBeBlank": true,
+            "fppModes": [
+                "remote"
+            ]
+        },
+        "SMPTEResendMultisync": {
+            "name": "SMPTEResendMultisync",
+            "description": "Send FPP MultiSync Packets",
+            "tip": "Send FPP MultiSync Packets",
+            "restart": 1,
+            "reboot": 0,
+            "type": "checkbox",
+            "default": 0,
+            "fppModes": [
+                "remote"
+            ]
+        }
+
+    }
+}

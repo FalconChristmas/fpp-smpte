@@ -21,11 +21,9 @@ public:
         SDL_Init(SDL_INIT_AUDIO);
         
         memset(&outputTimeCode, 0, sizeof(outputTimeCode));
-        if (settings["EnableSMPTEOutput"] == "1") {
-            enableOutput();
-        }
     }
     virtual ~FPPSMPTEPlugin() {
+        MultiSync::INSTANCE.removeMultiSyncPlugin(this);
         if (audioDev > 1) {
             SDL_PauseAudioDevice(audioDev, 1);
             SDL_CloseAudioDevice(audioDev);
@@ -49,7 +47,7 @@ public:
         }
         
         uint64_t frame = ms;
-        frame *= outputFramerate;
+        frame *= framerate;
         frame /= 1000;
         
         if (lastFrame != frame) {
@@ -58,7 +56,7 @@ public:
             } else {
                 uint64_t sf = ms % 1000;
                 ms /= 1000;
-                sf *= outputFramerate;
+                sf *= framerate;
                 sf /= 1000;
                 if (outputTimeCode.frame == sf && ((ms % 60) == outputTimeCode.secs)) {
                     //duplicate, return
@@ -81,7 +79,7 @@ public:
         int i = GetChannelOutputRefreshRate();
         ms += (1000/i);
         frame = ms;
-        frame *= outputFramerate;
+        frame *= framerate;
         frame /= 1000;
         if ((lastFrame+1) < frame) {
             //next frame will be skipped, queue it now
@@ -92,22 +90,31 @@ public:
             SDL_QueueAudio(audioDev, buf, len);
         }
     }
-    
+    uint64_t getTimestampFromPlaylist() {
+        int pos;
+        uint64_t ms;
+        uint64_t posms;
+        
+        ms = playlist->GetCurrentPosInMS(pos, posms);
+        if (hourIsIndex) {
+            ms = posms + pos * 60000 * 60;
+        }
+        return ms == 0 ? 1 : ms;  // zero is stop so we will use 1ms as a starting point
+    }
     virtual void SendSeqSyncPacket(const std::string &filename, int frames, float seconds) override {
         if (audioDev > 1) {
-            uint64_t ms = playlist->GetCurrentPosInMS();
-            encodeTimestamp(ms);
+            encodeTimestamp(getTimestampFromPlaylist());
         }
     }
     virtual void SendMediaSyncPacket(const std::string &filename, float seconds) {
         if (audioDev > 1) {
-            uint64_t ms = playlist->GetCurrentPosInMS();
-            encodeTimestamp(ms);
+            encodeTimestamp(getTimestampFromPlaylist());
         }
     }
     
     virtual void playlistCallback(const Json::Value &plj, const std::string &action, const std::string &section, int item) override {
         if (action == "stop") {
+            encodeTimestamp(0);
             stopAudio();
         } else if (action == "start") {
             startAudio();
@@ -116,9 +123,7 @@ public:
                 startAudio();
             }
             if (audioDev > 1) {
-                int pos = playlist->GetPosition();
-                positionMSOffset = playlist->GetPosStartInMS(pos);
-                encodeTimestamp(positionMSOffset);
+                encodeTimestamp(getTimestampFromPlaylist());
             }
         }
     }
@@ -142,9 +147,18 @@ public:
             want.samples = 1048;
             want.callback = nullptr;
 
+            /*
+            int count = SDL_GetNumAudioDevices(0);
+            for (int x = 0; x < count; x++) {
+                std::string de = SDL_GetAudioDeviceName(x, 0);
+                printf("Audio device %d: %s        %s\n", x, de.c_str(), (dev == de ? "true" : "false"));
+            }
+            */
+           
+            SDL_ClearError();
             audioDev = SDL_OpenAudioDevice(dev.c_str(), 0, &want, &obtained, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
             if (audioDev < 2) {
-                LogInfo(VB_PLUGIN, "SMPTE - Could not open Output Audio Device: %c\n", dev.c_str());
+                LogInfo(VB_PLUGIN, "SMPTE - Could not open Output Audio Device(%d): %s\nError: %s\n", audioDev, dev.c_str(), SDL_GetError());
                 return;
             }
             SDL_ClearError();
@@ -153,9 +167,9 @@ public:
                 SDL_PauseAudioDevice(audioDev, 0);
             }
             
-            ltc_encoder_set_bufsize(ltcEncoder, obtained.freq, outputFramerate);
-            ltc_encoder_reinit(ltcEncoder, obtained.freq, outputFramerate,
-                    outputFramerate==25?LTC_TV_625_50:LTC_TV_525_60, 0);
+            ltc_encoder_set_bufsize(ltcEncoder, obtained.freq, framerate);
+            ltc_encoder_reinit(ltcEncoder, obtained.freq, framerate,
+                    framerate==25?LTC_TV_625_50:LTC_TV_525_60, 0);
             ltc_encoder_set_filter(ltcEncoder, 0);
             //ltc_encoder_set_filter(ltcEncoder, 25.0);
             //ltc_encoder_set_volume(ltcEncoder, -18.0);
@@ -178,19 +192,17 @@ public:
                 LogInfo(VB_PLUGIN, "SMPTE - No Output Audio Device selected\n");
                 return false;
             }
-            enabled = true;
-            outputFramerate = std::stof(settings["SMPTEOutputFrameRate"]);
-            
+            enabled = true;            
             
             LTC_TV_STANDARD tvCode;
-            if (outputFramerate == 25) {
+            if (framerate == 25) {
                 tvCode = LTC_TV_625_50;
-            } else if (outputFramerate == 24) {
+            } else if (framerate == 24) {
                 tvCode = LTC_TV_FILM_24;
             } else {
                 tvCode = LTC_TV_525_60;
             }
-            ltcEncoder = ltc_encoder_create(48000, outputFramerate, tvCode, 0);
+            ltcEncoder = ltc_encoder_create(48000, framerate, tvCode, 0);
             ltc_encoder_set_timecode(ltcEncoder, &outputTimeCode);
             
             MultiSync::INSTANCE.addMultiSyncPlugin(this);
@@ -231,7 +243,7 @@ public:
             ltc_frame_to_time(&stime, &frame.ltc, 1);
             uint64_t msTimeStamp = ((stime.hours * 3600) + (stime.mins * 60) + stime.secs) * 1000;
             float f = stime.frame;
-            f /= p->inputFramerate;
+            f /= p->framerate;
             f *= 1000;
             msTimeStamp += f;
 
@@ -247,17 +259,13 @@ public:
         }
     }
     bool enableInput() {
-        if (getFPPmode() != REMOTE_MODE) {
-            return false;
-        }
         std::string dev = settings["SMPTEInputDevice"];
         if (dev == "") {
             LogInfo(VB_PLUGIN, "SMPTE - No Input Audio Device selected\n");
             return false;
         }
         ltcDecoder = ltc_decoder_create(1920, 16);
-        inputFramerate = std::stof(settings["SMPTEInputFrameRate"]);
-        
+
         SDL_AudioSpec want;
         SDL_AudioSpec obtained;
         
@@ -279,48 +287,62 @@ public:
         if (as == SDL_AUDIO_PAUSED) {
             SDL_PauseAudioDevice(audioDev, 0);
         }
-        
         return true;
     }
 
     virtual void addControlCallbacks(std::map<int, std::function<bool(int)>> &callbacks) {
-        if (settings["EnableSMPTEInput"] == "1" && enableInput()) {
-            actAsMaster = settings["SMPTEResendMultisync"] == "1";
-            inputEventFile = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-            callbacks[inputEventFile] = [this](int i) {
-                uint64_t ts;
-                ssize_t s = read(i, &ts, sizeof(ts));
-                while (s > 0) {
-                    s = read(i, &ts, sizeof(ts));
+        if (settings["SMPTETimeCodeEnabled"] == "1") {
+            framerate = std::stof(settings["SMPTETimeCodeType"]);
+            hourIsIndex = settings["SMPTETimeCodeHourIsIndex"] == "1";
+            if (getFPPmode() == REMOTE_MODE) {
+                if (enableInput()) {
+                    actAsMaster = settings["SMPTEResendMultisync"] == "1";
+                    inputEventFile = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+                    callbacks[inputEventFile] = [this](int i) {
+                        uint64_t ts;
+                        ssize_t s = read(i, &ts, sizeof(ts));
+                        while (s > 0) {
+                            s = read(i, &ts, sizeof(ts));
+                        }
+                        
+                        std::string pl = "";
+                        std::string f = "smpte-pl-" + std::to_string(currentUserBits);
+                        if (FileExists("/home/fpp/media/playlists/" + f + ".json")) {
+                            pl = f;
+                        }
+                        if (pl == "") {
+                            pl = settings["SMPTEInputPlaylist"];
+                        }
+                        if (pl == "--none--") {
+                            pl = "";
+                        }
+                        if (pl != "") {
+                            int pos = -1;
+                            uint64_t ms = currentPosMS;
+                            if (hourIsIndex) {
+                                pos = ms / (3600000);
+                                ms -= (pos * 3600000);
+                            }
+                            MultiSync::INSTANCE.SyncPlaylistToMS(ms, pos, pl, actAsMaster);
+                        }
+                        return false;
+                    };
                 }
-                
-                std::string pl = "";
-                std::string f = "smpte-pl-" + std::to_string(currentUserBits);
-                if (FileExists("/home/fpp/media/playlists/" + f + ".json")) {
-                    pl = f;
-                }
-                if (pl == "") {
-                    pl = settings["SMPTEInputPlaylist"];
-                }
-                if (pl == "--none--") {
-                    pl = "";
-                }
-                MultiSync::INSTANCE.SyncPlaylistToMS(currentPosMS, pl, actAsMaster);
-                return false;
-            };
+            } else {
+                enableOutput();
+            }
         }
     }
     
     
     void setDefaultSettings() {
-        setIfNotFound("EnableSMPTEOutput", "0");
-        setIfNotFound("EnableSMPTEInput", "0");
+        setIfNotFound("SMPTETimeCodeEnabled", "0");
         setIfNotFound("SMPTEOutputDevice", "");
-        setIfNotFound("SMPTEOutputFrameRate", "30");
         setIfNotFound("SMPTEInputDevice", "");
-        setIfNotFound("SMPTEInputFrameRate", "30");
-        setIfNotFound("SMPTEInputPlaylist", "--none--");
+        setIfNotFound("SMPTETimeCodeType", "30");
+        setIfNotFound("SMPTEInputPlaylist", "");
         setIfNotFound("SMPTEResendMultisync", "0");
+        setIfNotFound("SMPTETimeCodeHourIsIndex", "0");
     }
     void setIfNotFound(const std::string &s, const std::string &v, bool emptyAllowed = false) {
         if (settings.find(s) == settings.end()) {
@@ -336,15 +358,16 @@ public:
     bool        enabled = false;
     LTCDecoder *ltcDecoder = nullptr;
     ltc_off_t  decoderPos = 0;
-    float      inputFramerate = 30.0f;
     int        inputEventFile = -1;
     std::atomic<uint64_t> currentPosMS = 0;
     std::atomic<uint32_t> currentUserBits = 0;
     bool       actAsMaster = false;
     
-    
+
+    float      framerate = 30.0f;
+    bool       hourIsIndex = false;
+
     LTCEncoder *ltcEncoder = nullptr;
-    float      outputFramerate = 30.0f;
     SMPTETimecode outputTimeCode;
     uint64_t  positionMSOffset = 0;
 };
