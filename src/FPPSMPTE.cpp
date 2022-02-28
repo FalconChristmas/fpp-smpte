@@ -1,9 +1,11 @@
-#include "fpp-pch.h"
+#include <fpp-pch.h>
 
 #include <ltc.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_audio.h>
+#ifndef PLATFORM_OSX
 #include <sys/eventfd.h>
+#endif
 
 #include "FPPSMPTE.h"
 #include "Plugin.h"
@@ -34,8 +36,11 @@ public:
         if (ltcEncoder) {
             ltc_encoder_free(ltcEncoder);
         }
-        if (inputEventFile >= 0) {
-            close(inputEventFile);
+        if (inputEventFileRead >= 0) {
+            close(inputEventFileRead);
+        }
+        if (inputEventFileWrite >= 0 && inputEventFileWrite != inputEventFileRead) {
+            close(inputEventFileWrite);
         }
     }
     
@@ -106,7 +111,7 @@ public:
             encodeTimestamp(getTimestampFromPlaylist());
         }
     }
-    virtual void SendMediaSyncPacket(const std::string &filename, float seconds) {
+    virtual void SendMediaSyncPacket(const std::string &filename, float seconds) override {
         if (audioDev > 1) {
             encodeTimestamp(getTimestampFromPlaylist());
         }
@@ -248,12 +253,12 @@ public:
             msTimeStamp += f;
 
             uint64_t df = msTimeStamp > p->lastMS ? (msTimeStamp - p->lastMS) : (p->lastMS - msTimeStamp);
-            if (df > 0 && df < 5000 && p->inputEventFile >= 0) {
+            if (df > 0 && df < 5000 && p->inputEventFileWrite >= 0) {
                 //printf("msTimeStamp: %d     frame: %d\n", (int)msTimeStamp, (int)stime.frame);
                 p->currentPosMS = msTimeStamp;
                 p->currentUserBits =  getUserBits(&frame.ltc);
                 //printf("Frame: h: %d     m: %d    s:   %d    f: %d       ts: %d\n", stime.hours, stime.mins, stime.secs, stime.frame, (int)msTimeStamp);
-                write(p->inputEventFile, &msTimeStamp, sizeof(msTimeStamp));
+                write(p->inputEventFileWrite, &msTimeStamp, sizeof(msTimeStamp));
             }
             p->lastMS = msTimeStamp;
         }
@@ -290,15 +295,25 @@ public:
         return true;
     }
 
-    virtual void addControlCallbacks(std::map<int, std::function<bool(int)>> &callbacks) {
+    virtual void addControlCallbacks(std::map<int, std::function<bool(int)>> &callbacks) override {
         if (settings["SMPTETimeCodeEnabled"] == "1") {
             framerate = std::stof(settings["SMPTETimeCodeType"]);
             hourIsIndex = settings["SMPTETimeCodeHourIsIndex"] == "1";
             if (getFPPmode() == REMOTE_MODE) {
                 if (enableInput()) {
                     actAsMaster = settings["SMPTEResendMultisync"] == "1";
-                    inputEventFile = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-                    callbacks[inputEventFile] = [this](int i) {
+#ifndef PLATFORM_OSX
+                    inputEventFileRead = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+                    inputEventFileWrite = inputEventFileRead;
+#else
+                    int files[2];
+                    pipe(files);
+                    inputEventFileRead = files[0];
+                    inputEventFileWrite = files[1];
+                    fcntl(inputEventFileRead, F_SETFD, O_NONBLOCK);
+                    fcntl(inputEventFileWrite, F_SETFD, O_NONBLOCK);
+#endif
+                    callbacks[inputEventFileRead] = [this](int i) {
                         uint64_t ts;
                         ssize_t s = read(i, &ts, sizeof(ts));
                         while (s > 0) {
@@ -307,7 +322,7 @@ public:
                         
                         std::string pl = "";
                         std::string f = "smpte-pl-" + std::to_string(currentUserBits);
-                        if (FileExists("/home/fpp/media/playlists/" + f + ".json")) {
+                        if (FileExists(FPP_DIR_PLAYLIST(f + ".json"))) {
                             pl = f;
                         }
                         if (pl == "") {
@@ -358,7 +373,8 @@ public:
     bool        enabled = false;
     LTCDecoder *ltcDecoder = nullptr;
     ltc_off_t  decoderPos = 0;
-    int        inputEventFile = -1;
+    int        inputEventFileRead = -1;
+    int        inputEventFileWrite = -1;
     std::atomic<uint64_t> currentPosMS = 0;
     std::atomic<uint32_t> currentUserBits = 0;
     bool       actAsMaster = false;
