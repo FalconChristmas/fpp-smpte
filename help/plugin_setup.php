@@ -1,24 +1,18 @@
-The Open Sound Control (OSC) Plugin can be use to respond to OSC events by invoking FPP Commands.
 <p>
-The Listen Port is the port that FPP will listen on.  This needs to match the port the OSC controller is sending events to.
+
+The SMPTE plugin can be used to generate or respond to Linear Time Codes on an audio channel.
+</p>
 <p>
-For each Event added, the following fields need to be configured:
+
+When FPP is in Player mode, if the SMPTE plugin is enabled,it will generate time codes based 
+on the current playlist and output them on the selected sound device.   The timecode format
+can be configured to the various standard "fps" settings (which does not need to match what
+FPP is outputting).   If "Hour Field Is Playlist Index" is turned off, the timecode is elapsed
+time since the beginning of the playlist.  If it is turned on, the HOUR field of the timecode
+is the playlist index and the minutes/seconds/frame is the position in that song.
+</p>
 <p>
-<ol>
-<li>Description - this is a short description of what the event does.  This is ignored by FPP, but can be used to help you organized the events.</li>
-<li>Path - this is the path the OSC controller will be sending the desired event.</li>
-<li>Conditions - these are conditions to filter in/out events based on parameters in the message sent from the OSC controller.  For example, you could apply a condition to only respond to button down states insead of up and down.</li>
-<li>Command - the FPP Command to execute.   If the paramter starts with a single equal sign, it will be evaluated as a simple mathamatical formula.  For example, if parameter 1 is a "float" from a slider control ranging from 0.0-1.0 and you need the value to be 0-100 (example: Volume percent), then the command argument can be entred as "=p1*100".
-<p>
-If the parameter does not start with a single =, it is treated as a string, but parameters can be sustituted in by using %%p1%% in the string.  For example: "Matrix-%%p1%%".
-<p>
-    The plugin uses the TinyExpr library from https://github.com/codeplea/tinyexpr for implementing the expression processing.   We have added three useful functions:<br>
-    <ul>
-        <li>rgb(r, g, b) - will take the r/g/b values (0-255) and create an integer to represent the color </li>
-        <li>hsv(h, s, v) - will take the hue/saturation/value values (0-1) and create an integer to represent the color </li>
-        <li>if(cond, tExp, fExp) - will evaluate the condition and if not 0, will return tExp, otherwise fExp</li>
-    </ul>
-</li>
-</ol>
-<p>
-The "Last Messages" section in the upper right displays the last 10 messages that FPPD has received.  Clicking Refresh will refresh the list.  These can be used to help identify which parameters are being used to help define conditions.
+
+In remote mote, FPP can listen for Linear Time Codes on the selected audio capture device
+and sync a local playlist with those codes.  
+</p>
