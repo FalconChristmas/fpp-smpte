@@ -6,6 +6,7 @@
 #ifndef PLATFORM_OSX
 #include <sys/eventfd.h>
 #endif
+#include <cinttypes>
 
 #include "FPPSMPTE.h"
 #include "Plugin.h"
@@ -78,7 +79,8 @@ public:
             }
             lastFrame = frame;
             ltc_encoder_encode_frame(ltcEncoder);
-            ltcsnd_sample_t *buf = ltc_encoder_get_bufptr(ltcEncoder, &len, 1);
+            ltcsnd_sample_t *buf;
+            len = ltc_encoder_get_bufferptr(ltcEncoder, &buf, 1);
             SDL_QueueAudio(audioDev, buf, len);
         }
         int i = GetChannelOutputRefreshRate();
@@ -91,7 +93,8 @@ public:
             ltc_encoder_inc_timecode(ltcEncoder);
             lastFrame++;
             ltc_encoder_encode_frame(ltcEncoder);
-            ltcsnd_sample_t *buf = ltc_encoder_get_bufptr(ltcEncoder, &len, 1);
+            ltcsnd_sample_t *buf;
+            len = ltc_encoder_get_bufferptr(ltcEncoder, &buf, 1);
             SDL_QueueAudio(audioDev, buf, len);
         }
     }
@@ -100,9 +103,11 @@ public:
         uint64_t ms;
         uint64_t posms;
         
-        ms = playlist->GetCurrentPosInMS(pos, posms);
-        if (hourIsIndex) {
-            ms = posms + pos * 60000 * 60;
+        ms = playlist->GetCurrentPosInMS(pos, posms, timeCodePType == TimeCodeProcessingType::PLAYLIST_ITEM_DEFINED);
+        if (timeCodePType == TimeCodeProcessingType::HOUR) {
+            ms = posms + pos * 60*000 * 60;
+        } else if (timeCodePType == TimeCodeProcessingType::MIN15) {
+            ms = posms + pos * 15*000 * 60;
         }
         return ms == 0 ? 1 : ms;  // zero is stop so we will use 1ms as a starting point
     }
@@ -172,7 +177,7 @@ public:
                 SDL_PauseAudioDevice(audioDev, 0);
             }
             
-            ltc_encoder_set_bufsize(ltcEncoder, obtained.freq, framerate);
+            ltc_encoder_set_buffersize(ltcEncoder, obtained.freq, framerate);
             ltc_encoder_reinit(ltcEncoder, obtained.freq, framerate,
                     framerate==25?LTC_TV_625_50:LTC_TV_525_60, 0);
             ltc_encoder_set_filter(ltcEncoder, 0);
@@ -250,13 +255,32 @@ public:
             float f = stime.frame;
             f /= p->framerate;
             f *= 1000;
-            msTimeStamp += f;
+            uint64_t oms = f;
+            msTimeStamp += oms;
 
             uint64_t df = msTimeStamp > p->lastMS ? (msTimeStamp - p->lastMS) : (p->lastMS - msTimeStamp);
-            if (df > 0 && df < 5000 && p->inputEventFileWrite >= 0) {
+            if (df > 0 && df < 5000 && p->inputEventFileWrite >= 0) {                
                 //printf("msTimeStamp: %d     frame: %d\n", (int)msTimeStamp, (int)stime.frame);
+                int32_t idx = 0;
+                if (p->timeCodePType == TimeCodeProcessingType::HOUR) {
+                    constexpr int DIV = 1000 * 60 * 60;
+                    idx = msTimeStamp / DIV;
+                    msTimeStamp %= DIV;
+                } else if (p->timeCodePType == TimeCodeProcessingType::MIN15) {
+                    constexpr int DIV = 1000 * 60 * 15;
+                    idx = msTimeStamp / DIV;
+                    msTimeStamp %= DIV;
+                } else if (p->timeCodePType == TimeCodeProcessingType::PLAYLIST_ITEM_DEFINED) {
+                    idx = -2;
+                } else {
+                    idx = -1;
+                }
+                if (oms == 0 && stime.hours == 0 && stime.mins == 0 && stime.secs == 0) {
+                    idx = -99;
+                }
                 p->currentPosMS = msTimeStamp;
                 p->currentUserBits =  getUserBits(&frame.ltc);
+                p->currentIdx = idx;
                 //printf("Frame: h: %d     m: %d    s:   %d    f: %d       ts: %d\n", stime.hours, stime.mins, stime.secs, stime.frame, (int)msTimeStamp);
                 write(p->inputEventFileWrite, &msTimeStamp, sizeof(msTimeStamp));
             }
@@ -298,7 +322,17 @@ public:
     virtual void addControlCallbacks(std::map<int, std::function<bool(int)>> &callbacks) override {
         if (settings["SMPTETimeCodeEnabled"] == "1") {
             framerate = std::stof(settings["SMPTETimeCodeType"]);
-            hourIsIndex = settings["SMPTETimeCodeHourIsIndex"] == "1";
+
+            std::string tcpt = settings["SMPTETimeCodeProcessing"];
+            if (tcpt == "1") {
+                timeCodePType = TimeCodeProcessingType::HOUR;
+            } else if (tcpt == "2") {
+                timeCodePType = TimeCodeProcessingType::MIN15;
+            } else if (tcpt == "3") {
+                timeCodePType = TimeCodeProcessingType::PLAYLIST_ITEM_DEFINED;
+            } else {
+                timeCodePType = TimeCodeProcessingType::PLAYLIST_POS;
+            }            
             if (getFPPmode() == REMOTE_MODE) {
                 if (enableInput()) {
                     actAsMaster = settings["SMPTEResendMultisync"] == "1";
@@ -332,13 +366,13 @@ public:
                             pl = "";
                         }
                         if (pl != "") {
-                            int pos = -1;
                             uint64_t ms = currentPosMS;
-                            if (hourIsIndex) {
-                                pos = ms / (3600000);
-                                ms -= (pos * 3600000);
+                            int32_t idx = currentIdx;
+                            if (idx == -99) {
+                                MultiSync::INSTANCE.SyncStopAll();
+                            } else {
+                                MultiSync::INSTANCE.SyncPlaylistToMS(ms, idx, pl, actAsMaster);
                             }
-                            MultiSync::INSTANCE.SyncPlaylistToMS(ms, pos, pl, actAsMaster);
                         }
                         return false;
                     };
@@ -357,7 +391,7 @@ public:
         setIfNotFound("SMPTETimeCodeType", "30");
         setIfNotFound("SMPTEInputPlaylist", "");
         setIfNotFound("SMPTEResendMultisync", "0");
-        setIfNotFound("SMPTETimeCodeHourIsIndex", "0");
+        setIfNotFound("SMPTETimeCodeProcessing", "0");
     }
     void setIfNotFound(const std::string &s, const std::string &v, bool emptyAllowed = false) {
         if (settings.find(s) == settings.end()) {
@@ -377,11 +411,17 @@ public:
     int        inputEventFileWrite = -1;
     std::atomic<uint64_t> currentPosMS = 0;
     std::atomic<uint32_t> currentUserBits = 0;
+    std::atomic<int32_t>  currentIdx = 0;
     bool       actAsMaster = false;
     
 
     float      framerate = 30.0f;
-    bool       hourIsIndex = false;
+    enum class TimeCodeProcessingType {
+        PLAYLIST_POS,
+        HOUR,
+        MIN15,
+        PLAYLIST_ITEM_DEFINED
+    } timeCodePType;
 
     LTCEncoder *ltcEncoder = nullptr;
     SMPTETimecode outputTimeCode;
