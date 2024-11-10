@@ -45,7 +45,6 @@ public:
         }
     }
     
-    uint64_t lastFrame;
     void encodeTimestamp(uint64_t ms) {
         int len = SDL_GetQueuedAudioSize(audioDev);
         if (len > 2048) {
@@ -55,8 +54,8 @@ public:
         uint64_t frame = ms;
         frame *= framerate;
         frame /= 1000;
-        
-        if (lastFrame != frame) {
+       
+        if ((lastFrame < frame) || (frame == 0) || (lastFrame > frame + 3)) {
             if (lastFrame == (frame - 1)) {
                 ltc_encoder_inc_timecode(ltcEncoder);
             } else {
@@ -105,9 +104,9 @@ public:
         
         ms = playlist->GetCurrentPosInMS(pos, posms, timeCodePType == TimeCodeProcessingType::PLAYLIST_ITEM_DEFINED);
         if (timeCodePType == TimeCodeProcessingType::HOUR) {
-            ms = posms + pos * 60*000 * 60;
+            ms = posms + pos * 60 * 1000 * 60;
         } else if (timeCodePType == TimeCodeProcessingType::MIN15) {
-            ms = posms + pos * 15*000 * 60;
+            ms = posms + pos * 15 * 1000 * 60;
         }
         return ms == 0 ? 1 : ms;  // zero is stop so we will use 1ms as a starting point
     }
@@ -140,6 +139,7 @@ public:
     
     void startAudio() {
         if (audioDev <= 1 && enabled) {
+            lastFrame = 0;
             std::string dev = settings["SMPTEOutputDevice"];
             if (dev == "") {
                 LogInfo(VB_PLUGIN, "SMPTE - No Output Audio Device selected\n");
@@ -192,6 +192,7 @@ public:
             SDL_PauseAudioDevice(audioDev, 1);
             SDL_CloseAudioDevice(audioDev);
             audioDev = 0;
+            lastFrame = 0;
         }
     }
     
@@ -426,6 +427,7 @@ public:
     LTCEncoder *ltcEncoder = nullptr;
     SMPTETimecode outputTimeCode;
     uint64_t  positionMSOffset = 0;
+    uint64_t lastFrame = 0;
 };
 
 
