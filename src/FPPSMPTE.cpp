@@ -1,8 +1,8 @@
 #include <fpp-pch.h>
 
 #include <ltc.h>
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_audio.h>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_audio.h>
 #ifndef PLATFORM_OSX
 #include <sys/eventfd.h>
 #endif
@@ -18,18 +18,18 @@
 class FPPSMPTEPlugin : public FPPPlugin, public MultiSyncPlugin {
     
 public:
-    FPPSMPTEPlugin() : FPPPlugin("fpp-smpte"), audioDev(0) {
+    FPPSMPTEPlugin() : FPPPlugin("fpp-smpte") {
         LogInfo(VB_PLUGIN, "Initializing SMPTE Plugin\n");
         setDefaultSettings();
         SDL_Init(SDL_INIT_AUDIO);
-        
+
         memset(&outputTimeCode, 0, sizeof(outputTimeCode));
     }
     virtual ~FPPSMPTEPlugin() {
         MultiSync::INSTANCE.removeMultiSyncPlugin(this);
-        if (audioDev > 1) {
-            SDL_PauseAudioDevice(audioDev, 1);
-            SDL_CloseAudioDevice(audioDev);
+        if (audioStream) {
+            SDL_DestroyAudioStream(audioStream);
+            audioStream = nullptr;
         }
         if (ltcDecoder) {
             ltc_decoder_free(ltcDecoder);
@@ -46,7 +46,7 @@ public:
     }
     
     void encodeTimestamp(uint64_t ms) {
-        int len = SDL_GetQueuedAudioSize(audioDev);
+        int len = SDL_GetAudioStreamQueued(audioStream);
         if (len > 2048) {
             return;
         }
@@ -80,7 +80,7 @@ public:
             ltc_encoder_encode_frame(ltcEncoder);
             ltcsnd_sample_t *buf;
             len = ltc_encoder_get_bufferptr(ltcEncoder, &buf, 1);
-            SDL_QueueAudio(audioDev, buf, len);
+            SDL_PutAudioStreamData(audioStream, buf, len);
         }
         int i = GetChannelOutputRefreshRate();
         ms += (1000/i);
@@ -94,7 +94,7 @@ public:
             ltc_encoder_encode_frame(ltcEncoder);
             ltcsnd_sample_t *buf;
             len = ltc_encoder_get_bufferptr(ltcEncoder, &buf, 1);
-            SDL_QueueAudio(audioDev, buf, len);
+            SDL_PutAudioStreamData(audioStream, buf, len);
         }
     }
     uint64_t getTimestampFromPlaylist() {
@@ -111,12 +111,12 @@ public:
         return ms == 0 ? 1 : ms;  // zero is stop so we will use 1ms as a starting point
     }
     virtual void SendSeqSyncPacket(const std::string &filename, int frames, float seconds) override {
-        if (audioDev > 1) {
+        if (audioStream) {
             encodeTimestamp(getTimestampFromPlaylist());
         }
     }
     virtual void SendMediaSyncPacket(const std::string &filename, float seconds) override {
-        if (audioDev > 1) {
+        if (audioStream) {
             encodeTimestamp(getTimestampFromPlaylist());
         }
     }
@@ -128,57 +128,48 @@ public:
         } else if (action == "start") {
             startAudio();
         } else if (action == "playing") {
-            if (audioDev <= 1) {
+            if (!audioStream) {
                 startAudio();
             }
-            if (audioDev > 1) {
+            if (audioStream) {
                 encodeTimestamp(getTimestampFromPlaylist());
             }
         }
     }
     
     void startAudio() {
-        if (audioDev <= 1 && enabled) {
+        if (!audioStream && enabled) {
             lastFrame = 0;
             std::string dev = settings["SMPTEOutputDevice"];
             if (dev == "") {
                 LogInfo(VB_PLUGIN, "SMPTE - No Output Audio Device selected\n");
                 return;
             }
-            
-            SDL_AudioSpec want;
-            SDL_AudioSpec obtained;
-            
-            SDL_memset(&want, 0, sizeof(want));
-            SDL_memset(&obtained, 0, sizeof(obtained));
-            want.freq = 48000;
-            want.format = AUDIO_S16SYS;
-            want.channels = 1;
-            want.samples = 1048;
-            want.callback = nullptr;
 
-            /*
-            int count = SDL_GetNumAudioDevices(0);
-            for (int x = 0; x < count; x++) {
-                std::string de = SDL_GetAudioDeviceName(x, 0);
-                printf("Audio device %d: %s        %s\n", x, de.c_str(), (dev == de ? "true" : "false"));
-            }
-            */
-           
-            SDL_ClearError();
-            audioDev = SDL_OpenAudioDevice(dev.c_str(), 0, &want, &obtained, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
-            if (audioDev < 2) {
-                LogInfo(VB_PLUGIN, "SMPTE - Could not open Output Audio Device(%d): %s\nError: %s\n", audioDev, dev.c_str(), SDL_GetError());
+            // SDL3 streams resample from our spec to the device's native rate,
+            // so we always produce SMPTE_SAMPLE_RATE audio and let SDL convert.
+            SDL_AudioSpec want;
+            SDL_memset(&want, 0, sizeof(want));
+            want.freq = SMPTE_SAMPLE_RATE;
+            want.format = SDL_AUDIO_S16;
+            want.channels = 1;
+
+            SDL_AudioDeviceID devId = findAudioDevice(dev, false);
+            if (devId == 0) {
+                LogInfo(VB_PLUGIN, "SMPTE - Could not find Output Audio Device: %s\n", dev.c_str());
                 return;
             }
             SDL_ClearError();
-            SDL_AudioStatus as = SDL_GetAudioDeviceStatus(audioDev);
-            if (as == SDL_AUDIO_PAUSED) {
-                SDL_PauseAudioDevice(audioDev, 0);
+            audioStream = SDL_OpenAudioDeviceStream(devId, &want, nullptr, nullptr);
+            if (!audioStream) {
+                LogInfo(VB_PLUGIN, "SMPTE - Could not open Output Audio Device: %s   Error: %s\n", dev.c_str(), SDL_GetError());
+                return;
             }
-            
-            ltc_encoder_set_buffersize(ltcEncoder, obtained.freq, framerate);
-            ltc_encoder_reinit(ltcEncoder, obtained.freq, framerate,
+            // Streams open paused; start the device pulling from the stream.
+            SDL_ResumeAudioStreamDevice(audioStream);
+
+            ltc_encoder_set_buffersize(ltcEncoder, SMPTE_SAMPLE_RATE, framerate);
+            ltc_encoder_reinit(ltcEncoder, SMPTE_SAMPLE_RATE, framerate,
                     framerate==25?LTC_TV_625_50:LTC_TV_525_60, 0);
             ltc_encoder_set_filter(ltcEncoder, 0);
             //ltc_encoder_set_filter(ltcEncoder, 25.0);
@@ -188,10 +179,9 @@ public:
         }
     }
     void stopAudio() {
-        if (audioDev > 1) {
-            SDL_PauseAudioDevice(audioDev, 1);
-            SDL_CloseAudioDevice(audioDev);
-            audioDev = 0;
+        if (audioStream) {
+            SDL_DestroyAudioStream(audioStream);
+            audioStream = nullptr;
             lastFrame = 0;
         }
     }
@@ -245,8 +235,20 @@ public:
     
     
     uint64_t lastMS = 0;
-    static void InputAudioCallback(FPPSMPTEPlugin *p, Uint8* stream, int len) {
-        ltc_decoder_write_u16(p->ltcDecoder, (uint16_t*)stream, len / 2, p->decoderPos);
+    // SDL3 recording callback: drain everything currently available from the
+    // device stream and feed it to the libltc decoder.
+    static void SDLCALL InputAudioCallback(void *userdata, SDL_AudioStream *stream,
+                                           int additional_amount, int total_amount) {
+        FPPSMPTEPlugin *p = (FPPSMPTEPlugin*)userdata;
+        Uint8 buf[4096];
+        int got = SDL_GetAudioStreamData(stream, buf, sizeof(buf));
+        while (got > 0) {
+            decodeInputAudio(p, buf, got);
+            got = SDL_GetAudioStreamData(stream, buf, sizeof(buf));
+        }
+    }
+    static void decodeInputAudio(FPPSMPTEPlugin *p, Uint8* audioData, int len) {
+        ltc_decoder_write_u16(p->ltcDecoder, (uint16_t*)audioData, len / 2, p->decoderPos);
         p->decoderPos += len;
         LTCFrameExt frame;
         while (ltc_decoder_read(p->ltcDecoder, &frame)) {
@@ -297,27 +299,61 @@ public:
         ltcDecoder = ltc_decoder_create(1920, 16);
 
         SDL_AudioSpec want;
-        SDL_AudioSpec obtained;
-        
         SDL_memset(&want, 0, sizeof(want));
-        SDL_memset(&obtained, 0, sizeof(obtained));
-        want.freq = 48000;
-        want.format = AUDIO_S16SYS;
+        want.freq = SMPTE_SAMPLE_RATE;
+        want.format = SDL_AUDIO_S16;
         want.channels = 1;
-        want.samples = 1024;
-        want.callback = (SDL_AudioCallback)InputAudioCallback;
-        want.userdata = this;
-        audioDev = SDL_OpenAudioDevice(dev.c_str(), 1, &want, &obtained, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
-        if (audioDev < 2) {
-            LogInfo(VB_PLUGIN, "SMPTE - Could not open Input Audio Device: %c\n", dev.c_str());
+
+        SDL_AudioDeviceID devId = findAudioDevice(dev, true);
+        if (devId == 0) {
+            LogInfo(VB_PLUGIN, "SMPTE - Could not find Input Audio Device: %s\n", dev.c_str());
             return false;
         }
         SDL_ClearError();
-        SDL_AudioStatus as = SDL_GetAudioDeviceStatus(audioDev);
-        if (as == SDL_AUDIO_PAUSED) {
-            SDL_PauseAudioDevice(audioDev, 0);
+        audioStream = SDL_OpenAudioDeviceStream(devId, &want, InputAudioCallback, this);
+        if (!audioStream) {
+            LogInfo(VB_PLUGIN, "SMPTE - Could not open Input Audio Device: %s   Error: %s\n", dev.c_str(), SDL_GetError());
+            return false;
         }
+        // Streams open paused; start the device feeding the stream.
+        SDL_ResumeAudioStreamDevice(audioStream);
         return true;
+    }
+
+    // Resolve a stored device name (from FPP's aplay-derived AudioOutputList /
+    // AudioInputList) to an SDL3 device id. SDL3 opens devices by id, so we
+    // enumerate and match by name (exact, then substring since the stored name
+    // may not be byte-identical to SDL3's device name). Returns 0 if not found.
+    static SDL_AudioDeviceID findAudioDevice(const std::string &name, bool recording) {
+        int count = 0;
+        SDL_AudioDeviceID *devs = recording ? SDL_GetAudioRecordingDevices(&count)
+                                            : SDL_GetAudioPlaybackDevices(&count);
+        if (!devs) {
+            return 0;
+        }
+        SDL_AudioDeviceID found = 0;
+        for (int i = 0; i < count && !found; i++) {
+            const char *dn = SDL_GetAudioDeviceName(devs[i]);
+            if (dn && name == dn) {
+                found = devs[i];
+            }
+        }
+        for (int i = 0; i < count && !found; i++) {
+            const char *dn = SDL_GetAudioDeviceName(devs[i]);
+            if (dn && (name.find(dn) != std::string::npos || std::string(dn).find(name) != std::string::npos)) {
+                found = devs[i];
+            }
+        }
+        if (!found) {
+            LogWarn(VB_PLUGIN, "SMPTE - Audio device '%s' not found. Available %s devices:\n",
+                    name.c_str(), recording ? "input" : "output");
+            for (int i = 0; i < count; i++) {
+                const char *dn = SDL_GetAudioDeviceName(devs[i]);
+                LogWarn(VB_PLUGIN, "SMPTE -   %s\n", dn ? dn : "(null)");
+            }
+        }
+        SDL_free(devs);
+        return found;
     }
 
     virtual void addControlCallbacks(std::map<int, std::function<bool(int)>> &callbacks) override {
@@ -403,8 +439,9 @@ public:
     }
     
     
-    SDL_AudioDeviceID audioDev = 0;
-    
+    static constexpr int SMPTE_SAMPLE_RATE = 48000;
+    SDL_AudioStream *audioStream = nullptr;
+
     bool        enabled = false;
     LTCDecoder *ltcDecoder = nullptr;
     ltc_off_t  decoderPos = 0;

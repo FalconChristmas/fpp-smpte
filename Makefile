@@ -5,9 +5,9 @@ include $(SRCDIR)/makefiles/platform/*.mk
 all: libfpp-smpte.$(SHLIB_EXT)
 debug: all
 
-CFLAGS+=-I.
+CFLAGS+=-I. $(shell pkg-config --cflags sdl3)
 OBJECTS_fpp_smpte_so += src/FPPSMPTE.o
-LIBS_fpp_smpte_so += -L$(SRCDIR) -lfpp -ljsoncpp -lhttpserver -lltc -lSDL2
+LIBS_fpp_smpte_so += -L$(SRCDIR) -lfpp -ljsoncpp -lltc $(shell pkg-config --libs sdl3)
 CXXFLAGS_src/FPPSMPTE.o += -I$(SRCDIR)
 
 ifeq '$(ARCH)' 'OSX'
