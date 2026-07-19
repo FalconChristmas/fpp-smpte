@@ -6,13 +6,30 @@
 #ifndef PLATFORM_OSX
 #include <sys/eventfd.h>
 #endif
+#include <atomic>
 #include <cinttypes>
+#include <cstring>
+#include <mutex>
+#include <vector>
+
+#if __has_include(<pipewire/pipewire.h>)
+#include <pipewire/pipewire.h>
+#include <spa/param/audio/format-utils.h>
+#define HAS_PIPEWIRE_SOURCE 1
+#endif
 
 #include "FPPSMPTE.h"
 #include "Plugin.h"
 #include "MultiSync.h"
 #include "playlist/Playlist.h"
 #include "channeloutput/channeloutputthread.h"
+
+// AudioSourceRegistry is only present in FPP cores that support plugin
+// published PipeWire sources; compile the registration in when available.
+#if __has_include("mediaoutput/AudioSourceRegistry.h")
+#include "mediaoutput/AudioSourceRegistry.h"
+#define HAS_AUDIO_SOURCE_REGISTRY 1
+#endif
 
 
 class FPPSMPTEPlugin : public FPPPlugin, public MultiSyncPlugin {
@@ -27,6 +44,12 @@ public:
     }
     virtual ~FPPSMPTEPlugin() {
         MultiSync::INSTANCE.removeMultiSyncPlugin(this);
+#ifdef HAS_AUDIO_SOURCE_REGISTRY
+        AudioSourceRegistry::INSTANCE.unregisterPluginSources("fpp-smpte");
+#endif
+#ifdef HAS_PIPEWIRE_SOURCE
+        stopPipeWireSource();
+#endif
         if (audioStream) {
             SDL_DestroyAudioStream(audioStream);
             audioStream = nullptr;
@@ -45,12 +68,72 @@ public:
         }
     }
     
+    // ── Output abstraction: SDL device stream or PipeWire source node ──
+    bool outputActive() {
+#ifdef HAS_PIPEWIRE_SOURCE
+        if (pwStream) {
+            return true;
+        }
+#endif
+        return audioStream != nullptr;
+    }
+    // Queued LTC audio not yet consumed, in samples (output is U8 mono,
+    // so bytes == samples for both paths).
+    int queuedOutputSamples() {
+#ifdef HAS_PIPEWIRE_SOURCE
+        if (pwStream) {
+            std::lock_guard<std::mutex> lk(pwRingMutex);
+            return (int)pwRing.size();
+        }
+#endif
+        if (audioStream) {
+            return SDL_GetAudioStreamQueued(audioStream);
+        }
+        return 0;
+    }
+    void putOutputData(const uint8_t* buf, int len) {
+#ifdef HAS_PIPEWIRE_SOURCE
+        if (pwStream) {
+            std::lock_guard<std::mutex> lk(pwRingMutex);
+            // Safety cap; backpressure in encodeTimestamp() normally keeps
+            // the ring at 1-2 LTC frames.
+            if (pwRing.size() + len <= 16384) {
+                pwRing.insert(pwRing.end(), buf, buf + len);
+            }
+            return;
+        }
+#endif
+        if (audioStream) {
+            SDL_PutAudioStreamData(audioStream, buf, len);
+        }
+    }
+    // Offset (ms) added to the encoded timecode so that what is HEARD at
+    // the output lines up with the playlist position.  In PipeWire source
+    // mode the graph latency is auto-detected (pw_time.delay covers the
+    // whole path to the device, plus our own ring backlog); the user
+    // setting is an additional manual trim on top for latency outside the
+    // box (external gear, network receivers, ...).
+    int64_t currentOutputOffsetMS() {
+        int64_t off = outputOffsetMS;
+#ifdef HAS_PIPEWIRE_SOURCE
+        if (pwStream) {
+            off += pwAutoLatencyMS;
+        }
+#endif
+        return off;
+    }
+
     void encodeTimestamp(uint64_t ms) {
-        int len = SDL_GetAudioStreamQueued(audioStream);
+        int len = queuedOutputSamples();
         if (len > 2048) {
             return;
         }
-        
+        if (ms != 0) {
+            // ms == 0 is the stop/reset sentinel; don't offset it
+            int64_t adj = (int64_t)ms + currentOutputOffsetMS();
+            ms = adj < 1 ? 1 : (uint64_t)adj;
+        }
+
         uint64_t frame = ms;
         frame *= framerate;
         frame /= 1000;
@@ -80,7 +163,7 @@ public:
             ltc_encoder_encode_frame(ltcEncoder);
             ltcsnd_sample_t *buf;
             len = ltc_encoder_get_bufferptr(ltcEncoder, &buf, 1);
-            SDL_PutAudioStreamData(audioStream, buf, len);
+            putOutputData(buf, len);
         }
         int i = GetChannelOutputRefreshRate();
         ms += (1000/i);
@@ -94,7 +177,7 @@ public:
             ltc_encoder_encode_frame(ltcEncoder);
             ltcsnd_sample_t *buf;
             len = ltc_encoder_get_bufferptr(ltcEncoder, &buf, 1);
-            SDL_PutAudioStreamData(audioStream, buf, len);
+            putOutputData(buf, len);
         }
     }
     uint64_t getTimestampFromPlaylist() {
@@ -111,16 +194,16 @@ public:
         return ms == 0 ? 1 : ms;  // zero is stop so we will use 1ms as a starting point
     }
     virtual void SendSeqSyncPacket(const std::string &filename, int frames, float seconds) override {
-        if (audioStream) {
+        if (outputActive()) {
             encodeTimestamp(getTimestampFromPlaylist());
         }
     }
     virtual void SendMediaSyncPacket(const std::string &filename, float seconds) override {
-        if (audioStream) {
+        if (outputActive()) {
             encodeTimestamp(getTimestampFromPlaylist());
         }
     }
-    
+
     virtual void playlistCallback(const Json::Value &plj, const std::string &action, const std::string &section, int item) override {
         if (action == "stop") {
             encodeTimestamp(0);
@@ -128,17 +211,37 @@ public:
         } else if (action == "start") {
             startAudio();
         } else if (action == "playing") {
-            if (!audioStream) {
+            if (!outputActive()) {
                 startAudio();
             }
-            if (audioStream) {
+            if (outputActive()) {
                 encodeTimestamp(getTimestampFromPlaylist());
             }
         }
     }
-    
+
     void startAudio() {
-        if (!audioStream && enabled) {
+        if (!enabled) {
+            return;
+        }
+        if (usePipeWireSource) {
+#ifdef HAS_PIPEWIRE_SOURCE
+            // The PipeWire source node persists for the whole fppd session
+            // (created in enableOutput) so downstream routing stays linked;
+            // playlist start just resets the encoder timeline.
+            if (!pwStream) {
+                LogInfo(VB_PLUGIN, "SMPTE - PipeWire source not available\n");
+                return;
+            }
+            lastFrame = 0;
+            {
+                std::lock_guard<std::mutex> lk(pwRingMutex);
+                pwRing.clear();
+            }
+#else
+            return;
+#endif
+        } else if (!audioStream) {
             lastFrame = 0;
             std::string dev = settings["SMPTEOutputDevice"];
             if (dev == "") {
@@ -148,10 +251,11 @@ public:
 
             // SDL3 streams resample from our spec to the device's native rate,
             // so we always produce SMPTE_SAMPLE_RATE audio and let SDL convert.
+            // libltc produces unsigned 8 bit mono samples.
             SDL_AudioSpec want;
             SDL_memset(&want, 0, sizeof(want));
             want.freq = SMPTE_SAMPLE_RATE;
-            want.format = SDL_AUDIO_S16;
+            want.format = SDL_AUDIO_U8;
             want.channels = 1;
 
             SDL_AudioDeviceID devId = findAudioDevice(dev, false);
@@ -167,34 +271,191 @@ public:
             }
             // Streams open paused; start the device pulling from the stream.
             SDL_ResumeAudioStreamDevice(audioStream);
-
-            ltc_encoder_set_buffersize(ltcEncoder, SMPTE_SAMPLE_RATE, framerate);
-            ltc_encoder_reinit(ltcEncoder, SMPTE_SAMPLE_RATE, framerate,
-                    framerate==25?LTC_TV_625_50:LTC_TV_525_60, 0);
-            ltc_encoder_set_filter(ltcEncoder, 0);
-            //ltc_encoder_set_filter(ltcEncoder, 25.0);
-            //ltc_encoder_set_volume(ltcEncoder, -18.0);
-
-            encodeTimestamp(0);
+        } else {
+            return;
         }
+
+        ltc_encoder_set_buffersize(ltcEncoder, SMPTE_SAMPLE_RATE, framerate);
+        ltc_encoder_reinit(ltcEncoder, SMPTE_SAMPLE_RATE, framerate,
+                framerate==25?LTC_TV_625_50:LTC_TV_525_60, 0);
+        ltc_encoder_set_filter(ltcEncoder, 0);
+        //ltc_encoder_set_filter(ltcEncoder, 25.0);
+        //ltc_encoder_set_volume(ltcEncoder, -18.0);
+
+        encodeTimestamp(0);
     }
     void stopAudio() {
         if (audioStream) {
             SDL_DestroyAudioStream(audioStream);
             audioStream = nullptr;
-            lastFrame = 0;
+        }
+#ifdef HAS_PIPEWIRE_SOURCE
+        if (pwStream) {
+            // Keep the node; just drop any pending LTC so the output goes
+            // silent until the next playlist starts.
+            std::lock_guard<std::mutex> lk(pwRingMutex);
+            pwRing.clear();
+        }
+#endif
+        lastFrame = 0;
+    }
+
+#ifdef HAS_PIPEWIRE_SOURCE
+    static void onPwProcess(void *userdata) {
+        FPPSMPTEPlugin *p = (FPPSMPTEPlugin*)userdata;
+        struct pw_buffer *b = pw_stream_dequeue_buffer(p->pwStream);
+        if (!b) {
+            return;
+        }
+        struct spa_buffer *buf = b->buffer;
+        uint8_t *dst = (uint8_t*)buf->datas[0].data;
+        if (!dst) {
+            pw_stream_queue_buffer(p->pwStream, b);
+            return;
+        }
+        uint32_t want = buf->datas[0].maxsize;
+        if (b->requested > 0 && b->requested < want) {
+            want = (uint32_t)b->requested;   // frames == bytes for U8 mono
+        }
+        uint32_t filled = 0;
+        uint32_t backlog = 0;
+        {
+            std::lock_guard<std::mutex> lk(p->pwRingMutex);
+            backlog = (uint32_t)p->pwRing.size();
+            filled = backlog < want ? backlog : want;
+            if (filled) {
+                memcpy(dst, p->pwRing.data(), filled);
+                p->pwRing.erase(p->pwRing.begin(), p->pwRing.begin() + filled);
+            }
+        }
+        if (filled < want) {
+            memset(dst + filled, 0x80, want - filled);   // U8 silence
+        }
+        buf->datas[0].chunk->offset = 0;
+        buf->datas[0].chunk->stride = 1;
+        buf->datas[0].chunk->size = want;
+        pw_stream_queue_buffer(p->pwStream, b);
+
+        // Auto latency: time from a sample entering our ring to it being
+        // presented downstream.  pw_time.delay covers the graph path to the
+        // device (incl. loopbacks/filters); add our ring backlog and any
+        // resampler-buffered frames.  Exponentially smoothed to keep the
+        // encoded timecode from jittering.
+        struct pw_time t;
+        if (pw_stream_get_time_n(p->pwStream, &t, sizeof(t)) == 0 && t.rate.denom > 0) {
+            int64_t samples = backlog + (int64_t)t.buffered +
+                              t.delay * t.rate.num * (int64_t)SMPTE_SAMPLE_RATE / t.rate.denom;
+            int64_t ms = samples * 1000 / SMPTE_SAMPLE_RATE;
+            int64_t cur = p->pwAutoLatencyMS;
+            p->pwAutoLatencyMS = cur + (ms - cur) / 8;
         }
     }
-    
+    static void onPwStateChanged(void *userdata, enum pw_stream_state old,
+                                 enum pw_stream_state state, const char *error) {
+        LogDebug(VB_PLUGIN, "SMPTE - PipeWire source state: %s%s%s\n",
+                 pw_stream_state_as_string(state),
+                 error ? " error: " : "", error ? error : "");
+    }
+
+    bool startPipeWireSource() {
+        // fppd's PipeWire daemon runs with its own runtime dir; make sure we
+        // connect to it (no-op if fppd already set these).
+        setenv("PIPEWIRE_RUNTIME_DIR", "/run/pipewire-fpp", 0);
+        setenv("XDG_RUNTIME_DIR", "/run/pipewire-fpp", 0);
+
+        pw_init(nullptr, nullptr);
+        pwLoop = pw_thread_loop_new("fpp-smpte-ltc", nullptr);
+        if (!pwLoop) {
+            LogWarn(VB_PLUGIN, "SMPTE - Could not create PipeWire thread loop\n");
+            return false;
+        }
+        if (pw_thread_loop_start(pwLoop) != 0) {
+            LogWarn(VB_PLUGIN, "SMPTE - Could not start PipeWire thread loop\n");
+            pw_thread_loop_destroy(pwLoop);
+            pwLoop = nullptr;
+            return false;
+        }
+        pw_thread_loop_lock(pwLoop);
+        struct pw_properties *props = pw_properties_new(
+            PW_KEY_MEDIA_TYPE, "Audio",
+            PW_KEY_MEDIA_CATEGORY, "Playback",
+            PW_KEY_MEDIA_ROLE, "Production",
+            PW_KEY_MEDIA_CLASS, "Audio/Source",
+            PW_KEY_NODE_NAME, SMPTE_PW_NODE_NAME,
+            PW_KEY_NODE_DESCRIPTION, "FPP SMPTE LTC Timecode",
+            PW_KEY_NODE_VIRTUAL, "true",
+            "node.autoconnect", "false",
+            "node.always-process", "true",
+            nullptr);
+        static const struct pw_stream_events streamEvents = {
+            .version = PW_VERSION_STREAM_EVENTS,
+            .state_changed = onPwStateChanged,
+            .process = onPwProcess,
+        };
+        pwStream = pw_stream_new_simple(pw_thread_loop_get_loop(pwLoop),
+                                        "fpp-smpte-ltc", props, &streamEvents, this);
+        if (!pwStream) {
+            pw_thread_loop_unlock(pwLoop);
+            LogWarn(VB_PLUGIN, "SMPTE - Could not create PipeWire stream\n");
+            stopPipeWireSource();
+            return false;
+        }
+        uint8_t podBuffer[1024];
+        struct spa_pod_builder podB = SPA_POD_BUILDER_INIT(podBuffer, sizeof(podBuffer));
+        struct spa_audio_info_raw info = {};
+        info.format = SPA_AUDIO_FORMAT_U8;
+        info.rate = SMPTE_SAMPLE_RATE;
+        info.channels = 1;
+        info.position[0] = SPA_AUDIO_CHANNEL_MONO;
+        const struct spa_pod *params[1];
+        params[0] = spa_format_audio_raw_build(&podB, SPA_PARAM_EnumFormat, &info);
+        int res = pw_stream_connect(pwStream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
+                                    (enum pw_stream_flags)(PW_STREAM_FLAG_MAP_BUFFERS),
+                                    params, 1);
+        pw_thread_loop_unlock(pwLoop);
+        if (res < 0) {
+            LogWarn(VB_PLUGIN, "SMPTE - Could not connect PipeWire stream: %s\n", strerror(-res));
+            stopPipeWireSource();
+            return false;
+        }
+        LogInfo(VB_PLUGIN, "SMPTE - Publishing LTC as PipeWire source node '%s'\n", SMPTE_PW_NODE_NAME);
+        return true;
+    }
+    void stopPipeWireSource() {
+        if (pwStream) {
+            pw_thread_loop_lock(pwLoop);
+            pw_stream_destroy(pwStream);
+            pwStream = nullptr;
+            pw_thread_loop_unlock(pwLoop);
+        }
+        if (pwLoop) {
+            pw_thread_loop_stop(pwLoop);
+            pw_thread_loop_destroy(pwLoop);
+            pwLoop = nullptr;
+        }
+    }
+#endif
+
     bool enableOutput() {
         if (getFPPmode() & PLAYER_MODE) {
+            usePipeWireSource = settings["SMPTEOutputPipeWireSource"] == "1";
+#ifndef HAS_PIPEWIRE_SOURCE
+            if (usePipeWireSource) {
+                LogWarn(VB_PLUGIN, "SMPTE - Built without PipeWire support, falling back to output device\n");
+                usePipeWireSource = false;
+            }
+#endif
+            std::string off = settings["SMPTEOutputOffsetMS"];
+            if (!off.empty()) {
+                outputOffsetMS = std::atoi(off.c_str());
+            }
             std::string dev = settings["SMPTEOutputDevice"];
-            if (dev == "") {
+            if (!usePipeWireSource && dev == "") {
                 LogInfo(VB_PLUGIN, "SMPTE - No Output Audio Device selected\n");
                 return false;
             }
-            enabled = true;            
-            
+            enabled = true;
+
             LTC_TV_STANDARD tvCode;
             if (framerate == 25) {
                 tvCode = LTC_TV_625_50;
@@ -205,7 +466,26 @@ public:
             }
             ltcEncoder = ltc_encoder_create(48000, framerate, tvCode, 0);
             ltc_encoder_set_timecode(ltcEncoder, &outputTimeCode);
-            
+
+#ifdef HAS_PIPEWIRE_SOURCE
+            if (usePipeWireSource) {
+                if (startPipeWireSource()) {
+#ifdef HAS_AUDIO_SOURCE_REGISTRY
+                    AudioSourceRegistry::AudioSource src;
+                    src.id = "fpp-smpte:ltc";
+                    src.name = "SMPTE LTC Timecode";
+                    src.nodeName = SMPTE_PW_NODE_NAME;
+                    src.plugin = "fpp-smpte";
+                    src.channels = 1;
+                    src.sampleRate = SMPTE_SAMPLE_RATE;
+                    AudioSourceRegistry::INSTANCE.registerSource(src);
+#endif
+                } else {
+                    LogWarn(VB_PLUGIN, "SMPTE - PipeWire source unavailable; timecode output disabled\n");
+                }
+            }
+#endif
+
             MultiSync::INSTANCE.addMultiSyncPlugin(this);
             return true;
         }
@@ -424,6 +704,8 @@ public:
     void setDefaultSettings() {
         setIfNotFound("SMPTETimeCodeEnabled", "0");
         setIfNotFound("SMPTEOutputDevice", "");
+        setIfNotFound("SMPTEOutputPipeWireSource", "0");
+        setIfNotFound("SMPTEOutputOffsetMS", "0");
         setIfNotFound("SMPTEInputDevice", "");
         setIfNotFound("SMPTETimeCodeType", "30");
         setIfNotFound("SMPTEInputPlaylist", "");
@@ -440,7 +722,18 @@ public:
     
     
     static constexpr int SMPTE_SAMPLE_RATE = 48000;
+    static constexpr const char *SMPTE_PW_NODE_NAME = "fpp_smpte_ltc";
     SDL_AudioStream *audioStream = nullptr;
+
+    bool usePipeWireSource = false;
+    int outputOffsetMS = 0;      // manual trim from SMPTEOutputOffsetMS
+#ifdef HAS_PIPEWIRE_SOURCE
+    struct pw_thread_loop *pwLoop = nullptr;
+    struct pw_stream *pwStream = nullptr;
+    std::vector<uint8_t> pwRing;
+    std::mutex pwRingMutex;
+    std::atomic<int64_t> pwAutoLatencyMS{0};
+#endif
 
     bool        enabled = false;
     LTCDecoder *ltcDecoder = nullptr;

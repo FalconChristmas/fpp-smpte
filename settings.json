@@ -4,13 +4,15 @@
             "description": "SMPTE TimeCode Support",
             "settings": [
                 "SMPTETimeCodeEnabled",
+                "SMPTEOutputPipeWireSource",
                 "SMPTEOutputDevice",
+                "SMPTEOutputOffsetMS",
                 "SMPTEInputDevice",
                 "SMPTETimeCodeType",
                 "SMPTETimeCodeProcessing",
                 "SMPTEInputPlaylist",
                 "SMPTEResendMultisync"
-            ]   
+            ]
         }
     },
     "settings": {
@@ -25,7 +27,9 @@
             "children": {
                 "1": [
                     "SMPTETimeCodeType",
+                    "SMPTEOutputPipeWireSource",
                     "SMPTEOutputDevice",
+                    "SMPTEOutputOffsetMS",
                     "SMPTEInputDevice",
                     "SMPTETimeCodeProcessing",
                     "SMPTEInputPlaylist",
@@ -74,6 +78,33 @@
             "optionCanBeBlank": true,
             "fppModes": [
                 "remote"
+            ]
+        },
+        "SMPTEOutputPipeWireSource": {
+            "name": "SMPTEOutputPipeWireSource",
+            "description": "Output as PipeWire Source",
+            "tip": "Publish the LTC timecode as a routable PipeWire source node ('SMPTE LTC Timecode') instead of sending it directly to an output device.  Route it to outputs, AES67, etc. via Input/Output Mixing.  Requires a PipeWire media backend; the Output Sound Device setting is ignored when enabled.",
+            "restart": 1,
+            "reboot": 0,
+            "type": "checkbox",
+            "default": 0,
+            "fppModes": [
+                "player"
+            ]
+        },
+        "SMPTEOutputOffsetMS": {
+            "name": "SMPTEOutputOffsetMS",
+            "description": "Timecode Offset Trim (ms)",
+            "tip": "Extra offset added to the outgoing timecode, in milliseconds.  Positive values send timecode early.  In PipeWire Source mode the graph/device latency is auto-detected and compensated already - use this only to trim for latency outside FPP (external gear, network audio receivers, etc.).",
+            "restart": 1,
+            "reboot": 0,
+            "type": "number",
+            "min": -5000,
+            "max": 5000,
+            "step": 1,
+            "default": 0,
+            "fppModes": [
+                "player"
             ]
         },
         "SMPTEOutputDevice": {
