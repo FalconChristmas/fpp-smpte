@@ -6,6 +6,7 @@
 	"homeURL": "https://github.com/FalconChristmas/fpp-smpte",
 	"srcURL": "https://github.com/FalconChristmas/fpp-smpte.git",
 	"bugURL": "https://github.com/FalconChristmas/fpp-smpte/issues",
+	"iconURL": "https://raw.githubusercontent.com/FalconChristmas/fpp-smpte/master/icon.png",
 	"versions": [
         {
             "minFPPVersion": "4.0",
