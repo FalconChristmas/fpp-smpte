@@ -23,6 +23,7 @@
 #include "MultiSync.h"
 #include "playlist/Playlist.h"
 #include "channeloutput/channeloutputthread.h"
+#include "EPollManager.h"
 
 // AudioSourceRegistry is only present in FPP cores that support plugin
 // published PipeWire sources; compile the registration in when available.
@@ -35,7 +36,10 @@
 class FPPSMPTEPlugin : public FPPPlugin, public MultiSyncPlugin {
     
 public:
-    FPPSMPTEPlugin() : FPPPlugin("fpp-smpte") {
+    // The "true" asks FPP to watch config/plugin.fpp-smpte and call
+    // settingChanged() below, so changing the device or the timecode format
+    // no longer needs an fppd restart.
+    FPPSMPTEPlugin() : FPPPlugin("fpp-smpte", true) {
         LogInfo(VB_PLUGIN, "Initializing SMPTE Plugin\n");
         setDefaultSettings();
         SDL_Init(SDL_INIT_AUDIO);
@@ -60,6 +64,26 @@ public:
 
     // Idempotent, so shutdown() and the destructor can both call it.
     void teardown() {
+        stopRunningState();
+        // The wakeup descriptor outlives a reconfigure but not the plugin. It
+        // was registered by ensureInputEventFd() rather than handed to FPP
+        // through addControlCallbacks(), so FPP does not know about it - taking
+        // it back is this plugin's job, and the callback lives in this library.
+        if (inputEventFileRead >= 0) {
+            EPollManager::INSTANCE.removeFileDescriptor(inputEventFileRead);
+            close(inputEventFileRead);
+        }
+        if (inputEventFileWrite >= 0 && inputEventFileWrite != inputEventFileRead) {
+            close(inputEventFileWrite);
+        }
+        inputEventFileRead = -1;
+        inputEventFileWrite = -1;
+    }
+
+    // Everything a reconfigure has to undo: the registrations and the audio
+    // path. Deliberately leaves the wakeup descriptor alone - only the stream
+    // either side of it changes.
+    void stopRunningState() {
         MultiSync::INSTANCE.removeMultiSyncPlugin(this);
 #ifdef HAS_AUDIO_SOURCE_REGISTRY
         AudioSourceRegistry::INSTANCE.unregisterPluginSources("fpp-smpte");
@@ -79,14 +103,8 @@ public:
             ltc_encoder_free(ltcEncoder);
             ltcEncoder = nullptr;
         }
-        if (inputEventFileRead >= 0) {
-            close(inputEventFileRead);
-        }
-        if (inputEventFileWrite >= 0 && inputEventFileWrite != inputEventFileRead) {
-            close(inputEventFileWrite);
-        }
-        inputEventFileRead = -1;
-        inputEventFileWrite = -1;
+        lastFrame = 0;
+        memset(&outputTimeCode, 0, sizeof(outputTimeCode));
     }
     
     // ── Output abstraction: SDL device stream or PipeWire source node ──
@@ -658,70 +676,123 @@ public:
     }
 
     virtual void addControlCallbacks(std::map<int, std::function<bool(int)>> &callbacks) override {
-        if (settings["SMPTETimeCodeEnabled"] == "1") {
-            framerate = std::stof(settings["SMPTETimeCodeType"]);
+        // Nothing goes into the callbacks map: the wakeup descriptor is this
+        // plugin's own and is created and registered by applyConfiguration()
+        // whenever input is enabled, which may be now or after a settings
+        // change. teardown() takes it back - see the note there.
+        applyConfiguration();
+    }
 
-            std::string tcpt = settings["SMPTETimeCodeProcessing"];
-            if (tcpt == "1") {
-                timeCodePType = TimeCodeProcessingType::HOUR;
-            } else if (tcpt == "2") {
-                timeCodePType = TimeCodeProcessingType::MIN15;
-            } else if (tcpt == "3") {
-                timeCodePType = TimeCodeProcessingType::PLAYLIST_ITEM_DEFINED;
-            } else {
-                timeCodePType = TimeCodeProcessingType::PLAYLIST_POS;
-            }            
-            if (getFPPmode() == REMOTE_MODE) {
-                if (enableInput()) {
-                    actAsMaster = settings["SMPTEResendMultisync"] == "1";
-#ifndef PLATFORM_OSX
-                    inputEventFileRead = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-                    inputEventFileWrite = inputEventFileRead;
-#else
-                    int files[2];
-                    pipe(files);
-                    inputEventFileRead = files[0];
-                    inputEventFileWrite = files[1];
-                    fcntl(inputEventFileRead, F_SETFD, O_NONBLOCK);
-                    fcntl(inputEventFileWrite, F_SETFD, O_NONBLOCK);
-#endif
-                    callbacks[inputEventFileRead] = [this](int i) {
-                        uint64_t ts;
-                        ssize_t s = read(i, &ts, sizeof(ts));
-                        while (s > 0) {
-                            s = read(i, &ts, sizeof(ts));
-                        }
-                        
-                        std::string pl = "";
-                        std::string f = "smpte-pl-" + std::to_string(currentUserBits);
-                        if (FileExists(FPP_DIR_PLAYLIST(f + ".json"))) {
-                            pl = f;
-                        }
-                        if (pl == "") {
-                            pl = settings["SMPTEInputPlaylist"];
-                        }
-                        if (pl == "--none--") {
-                            pl = "";
-                        }
-                        if (pl != "") {
-                            uint64_t ms = currentPosMS;
-                            int32_t idx = currentIdx;
-                            if (idx == -99) {
-                                MultiSync::INSTANCE.SyncStopAll();
-                            } else {
-                                MultiSync::INSTANCE.SyncPlaylistToMS(ms, idx, pl, actAsMaster);
-                            }
-                        }
-                        return false;
-                    };
-                }
-            } else {
-                enableOutput();
+    // Bring the encoder/decoder into line with the current settings. Stops
+    // whatever is running first, so it is safe to call again - which is what
+    // lets a settings change take effect without restarting fppd. Runs on the
+    // main loop, both from addControlCallbacks() and from settingChanged().
+    void applyConfiguration() {
+        stopRunningState();
+
+        if (settings["SMPTETimeCodeEnabled"] != "1") {
+            return;
+        }
+        // User input, and this now runs whenever a setting changes rather than
+        // only at startup, so a throw would land on the main loop inside FPP's
+        // file-monitor callback and take fppd down mid-show.
+        framerate = safeStof(settings["SMPTETimeCodeType"], 30.0f, "SMPTETimeCodeType");
+
+        std::string tcpt = settings["SMPTETimeCodeProcessing"];
+        if (tcpt == "1") {
+            timeCodePType = TimeCodeProcessingType::HOUR;
+        } else if (tcpt == "2") {
+            timeCodePType = TimeCodeProcessingType::MIN15;
+        } else if (tcpt == "3") {
+            timeCodePType = TimeCodeProcessingType::PLAYLIST_ITEM_DEFINED;
+        } else {
+            timeCodePType = TimeCodeProcessingType::PLAYLIST_POS;
+        }
+        if (getFPPmode() == REMOTE_MODE) {
+            if (enableInput()) {
+                actAsMaster = settings["SMPTEResendMultisync"] == "1";
+                ensureInputEventFd();
             }
+        } else {
+            enableOutput();
         }
     }
-    
-    
+
+    // Called by FPP when config/plugin.fpp-smpte changes; the base class has
+    // already updated settings[key]. SMPTEInputPlaylist is read at point of use
+    // in the wakeup handler and so needs nothing here; everything else changes
+    // the device or the encoding, which means rebuilding.
+    virtual void settingChanged(const std::string &key, const std::string &value) override {
+        if (key == "SMPTEInputPlaylist") {
+            return;
+        }
+        LogInfo(VB_PLUGIN, "SMPTE: %s changed, reconfiguring\n", key.c_str());
+        applyConfiguration();
+    }
+
+    // The descriptor the SDL audio callback uses to wake the main loop. Created
+    // on demand rather than at startup so that enabling timecode later still
+    // gets one, and left in place across a reconfigure - only the audio stream
+    // either side of it changes.
+    void ensureInputEventFd() {
+        if (inputEventFileRead >= 0) {
+            return;
+        }
+#ifndef PLATFORM_OSX
+        inputEventFileRead = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        inputEventFileWrite = inputEventFileRead;
+#else
+        int files[2];
+        pipe(files);
+        inputEventFileRead = files[0];
+        inputEventFileWrite = files[1];
+        fcntl(inputEventFileRead, F_SETFD, O_NONBLOCK);
+        fcntl(inputEventFileWrite, F_SETFD, O_NONBLOCK);
+#endif
+        std::function<bool(int)> cb = [this](int i) {
+            uint64_t ts;
+            ssize_t s = read(i, &ts, sizeof(ts));
+            while (s > 0) {
+                s = read(i, &ts, sizeof(ts));
+            }
+
+            std::string pl = "";
+            std::string f = "smpte-pl-" + std::to_string(currentUserBits);
+            if (FileExists(FPP_DIR_PLAYLIST(f + ".json"))) {
+                pl = f;
+            }
+            if (pl == "") {
+                pl = settings["SMPTEInputPlaylist"];
+            }
+            if (pl == "--none--") {
+                pl = "";
+            }
+            if (pl != "") {
+                uint64_t ms = currentPosMS;
+                int32_t idx = currentIdx;
+                if (idx == -99) {
+                    MultiSync::INSTANCE.SyncStopAll();
+                } else {
+                    MultiSync::INSTANCE.SyncPlaylistToMS(ms, idx, pl, actAsMaster);
+                }
+            }
+            return false;
+        };
+        EPollManager::INSTANCE.addFileDescriptor(inputEventFileRead, cb);
+    }
+
+    static float safeStof(const std::string &s, float defVal, const char *name) {
+        try {
+            if (!s.empty()) {
+                return std::stof(s);
+            }
+        } catch (const std::exception &e) {
+            LogErr(VB_PLUGIN, "SMPTE: bad value for %s (\"%s\"): %s - using %0.1f\n",
+                   name, s.c_str(), e.what(), defVal);
+        }
+        return defVal;
+    }
+
     void setDefaultSettings() {
         setIfNotFound("SMPTETimeCodeEnabled", "0");
         setIfNotFound("SMPTEOutputDevice", "");
