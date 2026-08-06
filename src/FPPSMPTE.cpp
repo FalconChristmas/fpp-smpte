@@ -42,7 +42,24 @@ public:
 
         memset(&outputTimeCode, 0, sizeof(outputTimeCode));
     }
+    // Quiesce everything that can call into this plugin, while it is still a
+    // whole object. A destructor is too late for all three of these: the
+    // MultiSync callbacks run from the sequence/media path, InputAudioCallback
+    // runs on SDL's audio thread, and the PipeWire stream callbacks run on its
+    // own thread loop. Everything here is synchronous - SDL_DestroyAudioStream()
+    // unbinds the stream from the device, and pw_thread_loop_stop() joins the
+    // loop thread - so no readiness predicate is needed.
+    virtual std::function<bool()> shutdown() override {
+        teardown();
+        return nullptr;
+    }
+
     virtual ~FPPSMPTEPlugin() {
+        teardown(); // no-op if shutdown() already ran
+    }
+
+    // Idempotent, so shutdown() and the destructor can both call it.
+    void teardown() {
         MultiSync::INSTANCE.removeMultiSyncPlugin(this);
 #ifdef HAS_AUDIO_SOURCE_REGISTRY
         AudioSourceRegistry::INSTANCE.unregisterPluginSources("fpp-smpte");
@@ -56,9 +73,11 @@ public:
         }
         if (ltcDecoder) {
             ltc_decoder_free(ltcDecoder);
+            ltcDecoder = nullptr;
         }
         if (ltcEncoder) {
             ltc_encoder_free(ltcEncoder);
+            ltcEncoder = nullptr;
         }
         if (inputEventFileRead >= 0) {
             close(inputEventFileRead);
@@ -66,6 +85,8 @@ public:
         if (inputEventFileWrite >= 0 && inputEventFileWrite != inputEventFileRead) {
             close(inputEventFileWrite);
         }
+        inputEventFileRead = -1;
+        inputEventFileWrite = -1;
     }
     
     // ── Output abstraction: SDL device stream or PipeWire source node ──
@@ -760,6 +781,30 @@ public:
     uint64_t lastFrame = 0;
 };
 
+
+// Deliberately does NOT declare FPP_PLUGIN_SUPPORTS_UNLOAD.
+//
+// Unloading works - the MultiSync registration, the AudioSourceRegistry entry,
+// the PipeWire source and the SDL streams are all given back in shutdown(), and
+// the plugin object is destroyed - but the library stays mapped, which costs
+// address space and nothing else.
+//
+// The reason is that two of the things this plugin hands out are callbacks
+// invoked from threads it does not own, and it cannot prove from in here that
+// neither is executing once teardown returns:
+//
+//   - InputAudioCallback is given to SDL_OpenAudioDeviceStream() and runs on
+//     SDL's audio thread. SDL_DestroyAudioStream() unbinds it, but SDL is
+//     shared with FPP's own audio output, so this plugin never gets to shut SDL
+//     down and confirm the thread is gone.
+//   - The PipeWire stream events run on a thread loop. pw_thread_loop_stop()
+//     joins it, but the plugin does not own the PipeWire context either.
+//
+// Both are believed to be quiesced by the calls above. "Believed" is the
+// problem: getting it wrong is a jump into unmapped memory on an audio thread,
+// in the middle of a show that is using this plugin for timecode. Keeping a few
+// hundred KB mapped until fppd restarts is the cheaper side of that trade.
+// Revisit with a measurement, not an assumption.
 
 extern "C" {
     FPPPlugin *createPlugin() {
