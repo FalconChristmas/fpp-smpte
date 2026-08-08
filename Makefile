@@ -22,7 +22,7 @@ $(LTCHEADER):
 else
 LTCHEADER=/usr/include/ltc.h
 $(LTCHEADER):
-	sudo apt-get install -y libltc-dev
+	apt-get install -y libltc-dev
 endif
 
 
