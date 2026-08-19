@@ -19,6 +19,7 @@
 #endif
 
 #include "FPPSMPTE.h"
+#include "common.h"
 #include "Plugin.h"
 #include "MultiSync.h"
 #include "playlist/Playlist.h"
