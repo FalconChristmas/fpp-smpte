@@ -83,7 +83,7 @@
         "SMPTEOutputPipeWireSource": {
             "name": "SMPTEOutputPipeWireSource",
             "description": "Output as PipeWire Source",
-            "tip": "Publish the LTC timecode as a routable PipeWire source node ('SMPTE LTC Timecode') instead of sending it directly to an output device.  Route it to outputs, AES67, etc. via Input/Output Mixing.  Requires a PipeWire media backend; the Output Sound Device setting is ignored when enabled.",
+            "tip": "Publish the LTC timecode as a routable PipeWire source node ('SMPTE LTC Timecode') instead of sending it directly to an output device.  Route it to outputs, AES67, etc. by adding it as a 'PipeWire Source' member under Input Mixing (Mix Buses).  <b>Requires Media Backend to be set to 'PipeWire (Advanced)'</b> - Simple PipeWire does not expose Input Mixing, so the published node cannot be routed anywhere.  The Output Sound Device setting is ignored when this is enabled.",
             "restart": 0,
             "reboot": 0,
             "type": "checkbox",
@@ -110,7 +110,7 @@
         "SMPTEOutputDevice": {
             "name": "SMPTEOutputDevice",
             "description": "Output Sound Device",
-            "tip": "The Audio Output Device to send the TimeCode",
+            "tip": "The Audio Output Device to send the TimeCode.  On a PipeWire system this lists PipeWire sinks; if the list looks stale, restart fppd so the sinks are re-enumerated.",
             "restart": 0,
             "reboot": 0,
             "default": "",

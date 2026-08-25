@@ -85,6 +85,14 @@ public:
     // path. Deliberately leaves the wakeup descriptor alone - only the stream
     // either side of it changes.
     void stopRunningState() {
+        // Before anything else: startAudio() gates on this, and it is reached
+        // from playlistCallback(), which FPP keeps dispatching to every loaded
+        // plugin regardless of the MultiSync deregistration below. Leaving it
+        // set after a reconfigure that does not re-enable output means the next
+        // playlist start opens the device and then hands a freed-and-nulled
+        // ltcEncoder to libltc, which dereferences it immediately - fppd dies
+        // mid-show because someone unticked a checkbox.
+        enabled = false;
         MultiSync::INSTANCE.removeMultiSyncPlugin(this);
 #ifdef HAS_AUDIO_SOURCE_REGISTRY
         AudioSourceRegistry::INSTANCE.unregisterPluginSources("fpp-smpte");
@@ -315,6 +323,12 @@ public:
             return;
         }
 
+        if (!ltcEncoder) {
+            // enableOutput() is what builds the encoder; if it never ran (or a
+            // reconfigure tore it down) there is nothing to encode into.
+            LogWarn(VB_PLUGIN, "SMPTE - No LTC encoder; output not enabled\n");
+            return;
+        }
         ltc_encoder_set_buffersize(ltcEncoder, SMPTE_SAMPLE_RATE, framerate);
         ltc_encoder_reinit(ltcEncoder, SMPTE_SAMPLE_RATE, framerate,
                 framerate==25?LTC_TV_625_50:LTC_TV_525_60, 0);
@@ -426,6 +440,12 @@ public:
             PW_KEY_NODE_VIRTUAL, "true",
             "node.autoconnect", "false",
             "node.always-process", "true",
+            // Advertise the layout in the node props, not just in the format:
+            // FPP reads audio.channels off pw-dump when it lays out the
+            // loopback that patches this node into a mix bus, and a mono node
+            // that does not say so gets mixed in as silence.
+            PW_KEY_AUDIO_CHANNELS, "1",
+            SPA_KEY_AUDIO_POSITION, "MONO",
             nullptr);
         static const struct pw_stream_events streamEvents = {
             .version = PW_VERSION_STREAM_EVENTS,
@@ -520,12 +540,33 @@ public:
                     src.sampleRate = SMPTE_SAMPLE_RATE;
                     AudioSourceRegistry::INSTANCE.registerSource(src);
 #endif
+                    // The node is published, but the only place a PipeWire
+                    // source can be patched into the graph is Input Mixing
+                    // (Mix Buses), and FPP hides that whole settings group
+                    // unless the media backend is PipeWire (Advanced).
+                    if (getSetting("MediaBackend", "pipewire-simple") != "pipewire") {
+                        LogWarn(VB_PLUGIN, "SMPTE - LTC source published, but the media backend is not "
+                                           "PipeWire (Advanced), so Input Mixing is unavailable and there "
+                                           "is no way to route it. Set Media Backend to 'PipeWire (Advanced)' "
+                                           "under Input/Output Setup -> Audio/Video.\n");
+                    }
                 } else {
                     LogWarn(VB_PLUGIN, "SMPTE - PipeWire source unavailable; timecode output disabled\n");
                 }
             }
 #endif
 
+            // Timecode is generated from the MultiSync sequence/media sync
+            // callbacks, and FPP only fires those when MultiSync is on (see the
+            // isMultiSyncEnabled() gates in channeloutputthread.cpp and
+            // GStreamerOut.cpp). With it off the device opens, the encoder runs,
+            // and not a single frame is ever produced - so say so rather than
+            // leaving the user to wonder why the output is silent.
+            if (!MultiSync::INSTANCE.isMultiSyncEnabled()) {
+                LogWarn(VB_PLUGIN, "SMPTE - MultiSync is disabled, so FPP will not send the sync "
+                                   "callbacks this plugin generates timecode from. Enable MultiSync "
+                                   "under Input/Output Setup for timecode output to work.\n");
+            }
             MultiSync::INSTANCE.addMultiSyncPlugin(this);
             return true;
         }
