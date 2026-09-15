@@ -41,6 +41,28 @@
             "sha": "",
             "allowUpdates": 1
         }
-	]
+	],
+	"privacy": {
+	 "summary": "Listens to the audio input you pick, which may be a microphone, to read timecode; nothing is recorded. Can send the playback position to the FPP players on your network.",
+	 "sends": [
+	  {
+	   "to": "the FPP players on your network",
+	   "what": "the sequence and audio file names and playback position decoded from incoming timecode",
+	   "why": "so other FPP players follow the same timecode when you turn on Send FPP MultiSync Packets",
+	   "alwaysOn": false
+	  }
+	 ],
+	 "collects": [],
+	 "sensors": [
+	  {
+	   "type": "microphone",
+	   "stored": false
+	  }
+	 ],
+	 "remoteAccess": "none",
+	 "systemChanges": [],
+	 "closedCode": false,
+	 "other": "In remote mode the plugin opens the audio input device you pick, which may be a microphone; it only decodes timecode tones from it and keeps no audio. In player mode it plays timecode tones on the sound output you pick. Building it installs the libltc-dev package from Debian's standard repository with apt if it is not already present. Settings are kept after uninstall in config/plugin.fpp-smpte."
+	}
 }
 
